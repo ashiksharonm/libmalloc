@@ -1,0 +1,9 @@
+# Build artefacts
+build/
+
+# macOS
+.DS_Store
+
+# Editor directories
+.vscode/
+.idea/
