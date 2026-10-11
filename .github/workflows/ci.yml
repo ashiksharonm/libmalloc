@@ -4,10 +4,42 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  build-test:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test (-O0 and -O2)
+        run: |
+          make run
+          make clean
+          make run OPT=-O2
+      - name: AddressSanitizer
+        run: make asan
+      - name: UndefinedBehaviorSanitizer
+        run: make ubsan
+      - name: Shim: real programs under the allocator
+        run: make shim-test
+
+  tsan:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: make
-      - run: make run
-      - run: make asan
+      - run: make tsan
+
+  valgrind:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y valgrind
+      - run: make valgrind
+
+  sbrk-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test with the sbrk-backed arena
+        run: make run CFLAGS="-Wall -Wextra -Werror -g -O1 -std=gnu11 -pthread -DLM_USE_SBRK -I./src"
