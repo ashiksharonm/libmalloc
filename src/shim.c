@@ -7,12 +7,13 @@
  *          DYLD_INSERT_LIBRARIES, so this works on your own / Homebrew
  *          binaries only)
  *
- * Set LM_SHIM_REPORT=1 to print call counts and peak heap to stderr at exit,
+ * Set LM_SHIM_REPORT=<file> to append call counts and peak heap to that file at exit,
  * which is how the tests prove the shim was actually in the loop.
  */
 #define _DEFAULT_SOURCE
 #include "allocator.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -136,8 +137,13 @@ size_t malloc_usable_size(void *p) { return lm_usable_size(p); }
 #endif
 
 __attribute__((destructor)) static void report(void) {
-  const char *e = getenv("LM_SHIM_REPORT");
-  if (!e || *e != '1')
+  /* Appends to the file named by LM_SHIM_REPORT.  stderr is not used because
+   * coreutils closes it in an atexit handler that runs before destructors. */
+  const char *path = getenv("LM_SHIM_REPORT");
+  if (!path || !*path)
+    return;
+  int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0644);
+  if (fd < 0)
     return;
   char buf[200];
   int n = snprintf(buf, sizeof buf,
@@ -145,6 +151,7 @@ __attribute__((destructor)) static void report(void) {
                    "memalign=%lu peak_heap_bytes=%zu\n",
                    n_malloc, n_calloc, n_realloc, n_free, n_memalign,
                    lm_peak_heap_bytes());
-  if (n > 0 && write(2, buf, (size_t)n) < 0)
+  if (n > 0 && write(fd, buf, (size_t)n) < 0)
     return;
+  close(fd);
 }

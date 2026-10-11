@@ -13,12 +13,13 @@ fail=0
 # run_under <expected-stdout-regex|-> cmd...
 run_under() {
   expect=$1; shift
-  out=$(env "$PRELOAD=$SHIM" LM_SHIM_REPORT=1 "$@" 2>build/shim_stderr.txt) || {
+  rm -f build/shim_report.txt
+  out=$(env "$PRELOAD=$SHIM" LM_SHIM_REPORT=build/shim_report.txt "$@" 2>build/shim_stderr.txt) || {
     echo "FAIL (exit status): $*"; cat build/shim_stderr.txt; fail=1; return; }
   if [ "$expect" != "-" ] && ! printf '%s\n' "$out" | grep -Eq "$expect"; then
     echo "FAIL (output mismatch): $*"; fail=1; return; fi
   # Child processes (e.g. a pipeline) each print a line; total the malloc counts.
-  rep=$(grep 'libmalloc-shim' build/shim_stderr.txt || true)
+  rep=$(cat build/shim_report.txt 2>/dev/null || true)
   m=$(printf '%s\n' "$rep" | sed -n 's/.*malloc=\([0-9][0-9]*\) .*/\1/p' | awk '{s+=$1} END{print s+0}')
   if [ "$m" -eq 0 ]; then
     echo "FAIL (shim not in use): $*"; cat build/shim_stderr.txt; fail=1; return; fi
