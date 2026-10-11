@@ -21,7 +21,7 @@ jobs:
         run: make asan
       - name: UndefinedBehaviorSanitizer
         run: make ubsan
-      - name: Shim: real programs under the allocator
+      - name: Real programs under the malloc shim
         run: make shim-test
 
   tsan:

@@ -38,7 +38,7 @@ def main():
            "os": platform.platform(),
            "compiler": sh("cc --version | head -1"),
            "flags": "-O2 -std=gnu11 -pthread",
-           "notes": "median of 5 runs per cell; fragmentation = peak heap bytes "
+           "notes": "median of 5 runs per cell (after one discarded warm-up); fragmentation = peak heap bytes "
                     "/ peak requested bytes (not reported for the system allocator)",
            "results": []}
     for wl in WORKLOADS:

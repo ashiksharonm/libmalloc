@@ -4,7 +4,7 @@
  *   bench <impl> <workload>     impl: lm | sys     workload: random | bigrandom
  *                                         | realloc | small | mt4
  *
- * Prints one JSON object (throughput = median of REPS runs, plus peak-heap /
+ * Prints one JSON object (throughput = median of REPS runs after one warm-up run, plus peak-heap /
  * peak-requested fragmentation where the allocator can report its heap size).
  *
  * "lm" resolves to whichever allocator this binary was linked with: the
@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
 #ifdef BASELINE
   heap_base = heap_now();
 #endif
-  for (int rep = 0; rep < REPS; rep++) {
+  for (int rep = -1; rep < REPS; rep++) { /* rep -1 is a discarded warm-up */
     job_t jobs[MAX_THREADS];
     pthread_t th[MAX_THREADS];
     uint64_t t0 = now_ns();
@@ -178,7 +178,8 @@ int main(int argc, char **argv) {
       for (int t = 0; t < threads; t++)
         pthread_join(th[t], NULL);
     uint64_t t1 = now_ns();
-    ops_per_s[rep] = (double)ops / ((double)(t1 - t0) / 1e9);
+    if (rep >= 0)
+      ops_per_s[rep] = (double)ops / ((double)(t1 - t0) / 1e9);
     size_t req = 0;
     for (int t = 0; t < threads; t++)
       req += jobs[t].peak_req;
