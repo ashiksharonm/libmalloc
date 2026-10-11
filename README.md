@@ -33,7 +33,7 @@ Total heap consumption per allocation: `HEADER_SIZE + size + FOOTER_SIZE`
 ## Architecture
 
 ### Heap Growth
-Uses `sbrk()` to extend the process data segment on demand. Each new block is appended to a doubly-linked chain anchored at `heap_start`.
+Uses `sbrk()` to extend the process data segment on demand. Each new block is appended to a single implicit block list anchored at `heap_start` (blocks carry `next`/`prev` pointers in their headers, and free and used blocks share the same list; there is no separate free list).
 
 ### Free-List Strategy
 Two strategies, switchable at compile time:
@@ -65,7 +65,7 @@ Case 4: [FREE][THIS][FREE]  → three-way merge
 ### Safety
 - **Double-free detection**: magic field flips between `0xCAFEBABE` (used) and `0xDEADBEEF` (free). Double-free prints an error and calls `__builtin_trap()`.
 - **Overflow guard in calloc**: checks `nmemb * size` before multiplying.
-- **Alignment**: all sizes rounded up to `sizeof(void*)` (8 bytes on 64-bit).
+- **Alignment**: all sizes rounded up to a multiple of 16 bytes; returned payloads are 16-byte aligned (covered by a test).
 
 ---
 
@@ -99,10 +99,10 @@ make asan
 # Run double-free detection test (crashes intentionally)
 ./build/test_allocator double_free
 
-# Benchmark: first-fit vs glibc
+# Benchmark: first-fit vs system malloc (Apple libmalloc)
 make bench
 
-# Benchmark: best-fit vs glibc
+# Benchmark: best-fit vs system malloc (Apple libmalloc)
 make bench_best_fit
 
 # Valgrind (Linux only)
@@ -116,31 +116,29 @@ make clean
 
 ## Benchmark Results
 
-> **Fill in your actual numbers after running on Linux.**
-> These numbers were measured on Ubuntu/Debian x86-64 with `glibc`.
-> Do not use numbers from macOS — `sbrk()` is deprecated there and adds overhead.
+> Measured on a MacBook with Apple M5 (16 GB), macOS, `clang` at `-O0` (the Makefile's default `CFLAGS`), via `make bench` / `make bench_best_fit`. The baseline "glibc" column is the **system allocator on macOS (Apple libmalloc)**, not glibc; `sbrk()` is deprecated on macOS, so treat the absolute numbers as indicative only. Re-run on Linux for glibc numbers.
 
-**Methodology**: 5 runs per workload, minimum reported. Sizes: 8–4096 bytes (pseudo-random, LCG seed fixed for reproducibility). Timing: `clock_gettime(CLOCK_MONOTONIC)`.
+**Methodology**: 5 runs per workload, minimum reported. Sizes: 8-4096 bytes (pseudo-random, fixed LCG seed). Timing: `clock_gettime(CLOCK_MONOTONIC)`. The ratio is large because every `lm_malloc` does a linear scan of one block list (O(n)) while the system allocator uses size-segregated bins.
 
-### First-fit + Boundary Tags vs glibc
+### First-fit + Boundary Tags vs system malloc (Apple libmalloc)
 
-| Ops     | lm_malloc (µs) | glibc malloc (µs) | Ratio |
+| Ops     | lm_malloc (µs) | System malloc (µs) | Ratio |
 |---------|---------------|-------------------|-------|
-| 1,000   | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
-| 10,000  | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
-| 100,000 | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
+| 1,000 | 1,736.0 | 79.0 | 22.0x |
+| 10,000 | 229,577.0 | 867.0 | 264.8x |
+| 100,000 | 3,426,577.0 | 12,448.0 | 275.3x |
 
-### Best-fit + Boundary Tags vs glibc
+### Best-fit + Boundary Tags vs system malloc (Apple libmalloc)
 
-| Ops     | lm_malloc (µs) | glibc malloc (µs) | Ratio |
+| Ops     | lm_malloc (µs) | System malloc (µs) | Ratio |
 |---------|---------------|-------------------|-------|
-| 1,000   | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
-| 10,000  | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
-| 100,000 | [YOUR NUMBER] | [YOUR NUMBER]     | Xx    |
+| 1,000 | 1,163.0 | 65.0 | 17.9x |
+| 10,000 | 219,002.0 | 905.0 | 242.0x |
+| 100,000 | 3,133,312.0 | 11,390.0 | 275.1x |
 
 ---
 
-## Known Limitations vs glibc
+## Known Limitations vs system malloc (Apple libmalloc)
 
 | Feature | libmalloc | glibc (ptmalloc2) |
 |---------|-----------|-------------------|
