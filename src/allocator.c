@@ -65,12 +65,11 @@ static void write_footer(block_header_t *block) {
 }
 
 /* -------------------------------------------------------------------------
- * align_size — round up to the nearest multiple of sizeof(void*)
+ * align_size — round up to the nearest multiple of ALIGNMENT (16 bytes)
  * Also ensure the size is at least FOOTER_SIZE (so a footer always fits).
  * ------------------------------------------------------------------------- */
 static size_t align_size(size_t size) {
-  size_t alignment = sizeof(void *);
-  size = (size + alignment - 1) & ~(alignment - 1);
+  size = (size + ALIGNMENT - 1) & ~(size_t)(ALIGNMENT - 1);
   if (size < FOOTER_SIZE)
     size = FOOTER_SIZE;
   return size;
@@ -91,6 +90,7 @@ static inline void *header_to_ptr(block_header_t *block) {
  * Search strategies
  * ========================================================================= */
 
+#ifndef BEST_FIT
 /* First-fit: return first free block large enough */
 static block_header_t *find_first_fit(size_t size) {
   block_header_t *cur = heap_start;
@@ -101,7 +101,7 @@ static block_header_t *find_first_fit(size_t size) {
   }
   return NULL;
 }
-
+#else
 /* Best-fit: return smallest free block that still fits.
  * Scans entire list — O(n) always, but minimises wasted payload. */
 static block_header_t *find_best_fit(size_t size) {
@@ -119,6 +119,7 @@ static block_header_t *find_best_fit(size_t size) {
   }
   return best;
 }
+#endif
 
 static block_header_t *find_free_block(size_t size) {
 #ifdef BEST_FIT
@@ -198,6 +199,14 @@ static void split_block(block_header_t *block, size_t size) {
  * request_space — extend the heap via sbrk() and append a new block
  * ========================================================================= */
 static block_header_t *request_space(block_header_t *last, size_t size) {
+  /* Pad the break to ALIGNMENT once so every payload is 16-byte aligned
+   * (HEADER_SIZE is a multiple of 16 and all block sizes are too). */
+  if (last == NULL) {
+    uintptr_t brk = (uintptr_t)sbrk(0);
+    size_t pad = (ALIGNMENT - (brk % ALIGNMENT)) % ALIGNMENT;
+    if (pad && sbrk((intptr_t)pad) == (void *)-1)
+      return NULL;
+  }
   block_header_t *block = (block_header_t *)sbrk(0);
 
   void *request = sbrk((intptr_t)(HEADER_SIZE + size + FOOTER_SIZE));

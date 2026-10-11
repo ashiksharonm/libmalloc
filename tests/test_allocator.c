@@ -145,6 +145,18 @@ static void test_no_overlap(void) {
     lm_free(ptrs[i]);
 }
 
+static void test_alignment(void) {
+  size_t sizes[] = {1, 3, 8, 17, 24, 100, 1000, 4097};
+  void *ptrs[sizeof(sizes) / sizeof(sizes[0])];
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+    ptrs[i] = lm_malloc(sizes[i]);
+    assert(ptrs[i] != NULL);
+    assert(((uintptr_t)ptrs[i] % 16) == 0);
+  }
+  for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+    lm_free(ptrs[i]);
+}
+
 static void test_malloc_zero(void) { assert(lm_malloc(0) == NULL); }
 
 static void test_free_null(void) { lm_free(NULL); /* must not crash */ }
@@ -347,6 +359,7 @@ int main(int argc, char *argv[]) {
   RUN_TEST("realloc grow + data preserved", test_realloc_grow);
   RUN_TEST("free then reuse (first-fit)", test_free_reuse);
   RUN_TEST("multi-alloc no overlap", test_no_overlap);
+  RUN_TEST("payloads are 16-byte aligned", test_alignment);
   RUN_TEST("malloc(0) returns NULL", test_malloc_zero);
   RUN_TEST("free(NULL) no-op", test_free_null);
   RUN_TEST("coalescing adjacent blocks", test_coalescing);

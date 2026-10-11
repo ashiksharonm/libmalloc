@@ -24,7 +24,7 @@ LIB_SRCS  = $(SRC_DIR)/allocator.c $(SRC_DIR)/utils.c
 TEST_SRC  = $(TEST_DIR)/test_allocator.c
 
 # =============================================================================
-.PHONY: all tests run best_fit asan valgrind clean
+.PHONY: all tests run best_fit asan valgrind bench bench_best_fit clean
 
 all: tests
 

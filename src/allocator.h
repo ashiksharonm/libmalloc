@@ -53,6 +53,9 @@ typedef struct block_header {
   struct block_header *prev; /* previous block in chain                  */
 } block_header_t;
 
+_Static_assert(sizeof(block_header_t) % 16 == 0,
+               "header size must keep payloads 16-byte aligned");
+
 /* -------------------------------------------------------------------------
  * block_footer_t — sits at the END of every allocated block (boundary tag)
  * The footer makes it possible to find the preceding physical block in O(1).
@@ -61,6 +64,10 @@ typedef struct {
   size_t size; /* must always equal the header's .size  */
   int is_free; /* must always equal the header's is_free */
 } block_footer_t;
+
+/* Payload alignment guaranteed by lm_malloc (matches max_align_t on x86-64
+ * and arm64). */
+#define ALIGNMENT 16
 
 /* Sizes */
 #define HEADER_SIZE (sizeof(block_header_t))
