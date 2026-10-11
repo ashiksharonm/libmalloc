@@ -166,13 +166,74 @@ static void test_coalescing(void) {
   void *b = lm_malloc(32);
   void *c = lm_malloc(32);
   assert(a && b && c);
+  int contiguous = ((char *)b == (char *)a + 48) && ((char *)c == (char *)b + 48);
   lm_free(b);
   lm_free(a);
   lm_free(c);
+  assert(lm_check() == 0);
   void *combined = lm_malloc(90);
   assert(combined != NULL);
-  assert(combined == a); /* merged region reused from start */
+  /* When the three blocks were carved back to back, the merged region must be
+   * reused from its start. */
+  if (contiguous)
+    assert(combined == a);
   lm_free(combined);
+  assert(lm_check() == 0);
+}
+
+static void test_posix_memalign(void) {
+  size_t aligns[] = {16, 32, 64, 256, 4096, 65536};
+  for (size_t i = 0; i < sizeof aligns / sizeof aligns[0]; i++) {
+    void *p = NULL;
+    assert(lm_posix_memalign(&p, aligns[i], 100) == 0);
+    assert(((uintptr_t)p % aligns[i]) == 0);
+    memset(p, 0x5A, 100);
+    assert(lm_check() == 0);
+    lm_free(p);
+    assert(lm_check() == 0);
+  }
+  void *p;
+  assert(lm_posix_memalign(&p, 3, 8) != 0);  /* not a power of two */
+  assert(lm_posix_memalign(&p, 4, 8) != 0);  /* smaller than sizeof(void*) */
+  assert(lm_aligned_alloc(64, 0) != NULL);
+}
+
+static void test_usable_size(void) {
+  size_t sizes[] = {1, 24, 25, 100, 1000, 300000};
+  for (size_t i = 0; i < sizeof sizes / sizeof sizes[0]; i++) {
+    unsigned char *p = lm_malloc(sizes[i]);
+    assert(p && lm_usable_size(p) >= sizes[i]);
+    memset(p, 0xEE, lm_usable_size(p)); /* the whole range must be writable */
+    assert(lm_check() == 0);
+    lm_free(p);
+  }
+}
+
+static void test_large_returned_to_os(void) {
+  size_t before = lm_heap_bytes();
+  void *p = lm_malloc(4u << 20);
+  assert(p && lm_heap_bytes() >= before + (4u << 20));
+  lm_free(p);
+  assert(lm_heap_bytes() == before);
+}
+
+static void test_realloc_patterns(void) {
+  /* grow in place / by copy / shrink / across the mmap threshold */
+  unsigned char *p = lm_malloc(40);
+  for (int i = 0; i < 40; i++)
+    p[i] = (unsigned char)i;
+  size_t sizes[] = {80, 41, 4000, 200, 500000, 600000, 100, 1};
+  size_t have = 40;
+  for (size_t k = 0; k < sizeof sizes / sizeof sizes[0]; k++) {
+    p = lm_realloc(p, sizes[k]);
+    assert(p);
+    size_t keep = have < sizes[k] ? have : sizes[k];
+    for (size_t i = 0; i < keep && i < 40; i++)
+      assert(p[i] == (unsigned char)i);
+    have = sizes[k];
+    assert(lm_check() == 0);
+  }
+  lm_free(p);
 }
 
 /* =========================================================================
@@ -321,6 +382,8 @@ static void test_stress(void) {
     }
   }
 
+  assert(lm_check() == 0);
+
   /* Drain remaining live blocks */
   for (int s = 0; s < STRESS_LIVE; s++) {
     if (live[s]) {
@@ -363,6 +426,10 @@ int main(int argc, char *argv[]) {
   RUN_TEST("malloc(0) returns NULL", test_malloc_zero);
   RUN_TEST("free(NULL) no-op", test_free_null);
   RUN_TEST("coalescing adjacent blocks", test_coalescing);
+  RUN_TEST("posix_memalign / aligned_alloc", test_posix_memalign);
+  RUN_TEST("usable size is fully writable", test_usable_size);
+  RUN_TEST("large block returned to the OS", test_large_returned_to_os);
+  RUN_TEST("realloc grow/shrink/mmap patterns", test_realloc_patterns);
 
   printf("\n-- Phase 4: Edge Cases & Stress --\n");
   RUN_TEST("large alloc (1 MB) read/write", test_large_alloc);

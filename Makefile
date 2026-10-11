@@ -1,91 +1,36 @@
-# =============================================================================
-# Makefile — libmalloc (Phase 2)
+# libmalloc
 #
-# Targets:
-#   make / make tests     build default (first-fit + boundary tags)
-#   make run              build and run tests
-#   make best_fit         build with best-fit search strategy enabled
-#   make asan             AddressSanitizer build (macOS M2 / Linux substitute for Valgrind)
-#   make valgrind         Linux only: run under valgrind --leak-check=full
-#   make clean            remove build artefacts
-#
-# Strategy flag:
-#   Default (no flag):    first-fit
-#   -DBEST_FIT:           best-fit
-# =============================================================================
+#   make run        build and run the single-threaded test suite
+#   make asan       tests under AddressSanitizer
+#   make bench      benchmark (see bench/)
+#   make clean
 
-CC        = gcc
-CFLAGS    = -Wall -Wextra -g -O0 -I./src
-SRC_DIR   = src
-TEST_DIR  = tests
-BUILD_DIR = build
+CC      ?= cc
+OPT     ?= -O0
+CFLAGS  ?= -Wall -Wextra -Werror -g $(OPT) -std=gnu11
+CFLAGS  += -I./src
+BUILD   = build
 
-LIB_SRCS  = $(SRC_DIR)/allocator.c $(SRC_DIR)/utils.c
-TEST_SRC  = $(TEST_DIR)/test_allocator.c
+LIB_SRCS = src/allocator.c
+TEST_SRC = tests/test_allocator.c
 
-# =============================================================================
-.PHONY: all tests run best_fit asan valgrind bench bench_best_fit clean
-
+.PHONY: all tests run asan clean
 all: tests
 
-# --- Default: first-fit + boundary tags ---
-tests: $(BUILD_DIR)/test_allocator
+tests: $(BUILD)/test_allocator
+$(BUILD)/test_allocator: $(LIB_SRCS) $(TEST_SRC) src/allocator.h | $(BUILD)
+	$(CC) $(CFLAGS) -o $@ $(LIB_SRCS) $(TEST_SRC)
 
-$(BUILD_DIR)/test_allocator: $(LIB_SRCS) $(TEST_SRC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $@ $^
-	@echo ""
-	@echo "Build [first-fit] → $(BUILD_DIR)/test_allocator"
-	@echo "Run:  make run"
-	@echo ""
+run: $(BUILD)/test_allocator
+	./$(BUILD)/test_allocator
+	@./$(BUILD)/test_allocator double_free 2>/dev/null && { echo "double-free not trapped"; exit 1; } || echo "double-free trapped as expected"
 
-# --- Build then immediately run ---
-run: $(BUILD_DIR)/test_allocator
-	./$(BUILD_DIR)/test_allocator
+asan: $(LIB_SRCS) $(TEST_SRC) | $(BUILD)
+	$(CC) $(CFLAGS) -fsanitize=address -fno-omit-frame-pointer -o $(BUILD)/test_asan $^
+	./$(BUILD)/test_asan
 
-# --- Best-fit variant ---
-best_fit: $(LIB_SRCS) $(TEST_SRC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -DBEST_FIT -o $(BUILD_DIR)/test_allocator_bestfit $^
-	@echo ""
-	@echo "Build [best-fit] → $(BUILD_DIR)/test_allocator_bestfit"
-	./$(BUILD_DIR)/test_allocator_bestfit
+$(BUILD):
+	mkdir -p $(BUILD)
 
-# --- AddressSanitizer (macOS M2 safe; do NOT combine with Valgrind) ---
-asan: $(LIB_SRCS) $(TEST_SRC) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -fsanitize=address,undefined -o $(BUILD_DIR)/test_allocator_asan $^
-	@echo "Running with AddressSanitizer..."
-	./$(BUILD_DIR)/test_allocator_asan
-
-# --- Benchmark: first-fit vs glibc ---
-bench: $(LIB_SRCS) bench/bench.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -o $(BUILD_DIR)/bench $^
-	@echo ""
-	@echo "Running benchmark [first-fit]..."
-	./$(BUILD_DIR)/bench
-
-# --- Benchmark: best-fit vs glibc ---
-bench_best_fit: $(LIB_SRCS) bench/bench.c | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -DBEST_FIT -o $(BUILD_DIR)/bench_bestfit $^
-	@echo ""
-	@echo "Running benchmark [best-fit]..."
-	./$(BUILD_DIR)/bench_bestfit
-
-# --- Valgrind target (Linux / Ubuntu only) ---
-# Usage: ssh into your Linux box, clone the repo, run: make valgrind
-valgrind: $(BUILD_DIR)/test_allocator
-	@command -v valgrind >/dev/null 2>&1 || \
-	  { echo "ERROR: valgrind not found. Install with: sudo apt install valgrind"; exit 1; }
-	valgrind \
-	  --leak-check=full \
-	  --show-leak-kinds=all \
-	  --track-origins=yes \
-	  --error-exitcode=1 \
-	  ./$(BUILD_DIR)/test_allocator
-
-# --- Directory ---
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
-
-# --- Clean ---
 clean:
-	rm -rf $(BUILD_DIR)
-	@echo "Cleaned."
+	rm -rf $(BUILD)
