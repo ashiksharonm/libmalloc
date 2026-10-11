@@ -17,11 +17,12 @@ run_under() {
     echo "FAIL (exit status): $*"; cat build/shim_stderr.txt; fail=1; return; }
   if [ "$expect" != "-" ] && ! printf '%s\n' "$out" | grep -Eq "$expect"; then
     echo "FAIL (output mismatch): $*"; fail=1; return; fi
+  # Child processes (e.g. a pipeline) each print a line; total the malloc counts.
   rep=$(grep 'libmalloc-shim' build/shim_stderr.txt || true)
-  m=$(printf '%s' "$rep" | sed -n 's/.*malloc=\([0-9]*\).*/\1/p')
-  if [ -z "$m" ] || [ "$m" -eq 0 ]; then
-    echo "FAIL (shim not in use): $*"; fail=1; return; fi
-  echo "ok: $*  ->  $rep"
+  m=$(printf '%s\n' "$rep" | sed -n 's/.*malloc=\([0-9][0-9]*\) .*/\1/p' | awk '{s+=$1} END{print s+0}')
+  if [ "$m" -eq 0 ]; then
+    echo "FAIL (shim not in use): $*"; cat build/shim_stderr.txt; fail=1; return; fi
+  echo "ok: $*  ->  $(printf '%s\n' "$rep" | tail -1) (malloc calls summed over processes: $m)"
 }
 
 mkdir -p build
