@@ -400,6 +400,53 @@ static void test_stress(void) {
   assert(total_frees > 1000);
 }
 
+/* Mixed malloc/realloc/free over sizes spanning every size class (including
+ * the mmap path), checking the heap invariants and per-block fill patterns. */
+#define MIX_SLOTS 256
+static void test_mixed_sizes(void) {
+  static struct {
+    unsigned char *p;
+    size_t n;
+    unsigned char tag;
+  } sl[MIX_SLOTS];
+  memset(sl, 0, sizeof sl);
+  for (int op = 0; op < 20000; op++) {
+    uint32_t r = lcg_next();
+    int k = (int)((r >> 8) % MIX_SLOTS);
+    /* log-uniform size: 1 byte .. ~300 KB */
+    size_t n = (size_t)1 << ((r >> 20) % 19);
+    n += lcg_next() % n;
+    if (sl[k].p) {
+      for (size_t i = 0; i < sl[k].n; i += 61)
+        assert(sl[k].p[i] == sl[k].tag);
+      if (r & 1) {
+        unsigned char *q = lm_realloc(sl[k].p, n);
+        assert(q);
+        size_t keep = sl[k].n < n ? sl[k].n : n;
+        for (size_t i = 0; i < keep; i += 61)
+          assert(q[i] == sl[k].tag);
+        sl[k].p = q;
+        sl[k].n = n;
+        memset(q, sl[k].tag, n);
+      } else {
+        lm_free(sl[k].p);
+        sl[k].p = NULL;
+      }
+    } else {
+      sl[k].p = lm_malloc(n);
+      assert(sl[k].p);
+      sl[k].n = n;
+      sl[k].tag = (unsigned char)(r >> 16) | 1;
+      memset(sl[k].p, sl[k].tag, n);
+    }
+    if (op % 500 == 0)
+      assert(lm_check() == 0);
+  }
+  for (int k = 0; k < MIX_SLOTS; k++)
+    lm_free(sl[k].p);
+  assert(lm_check() == 0);
+}
+
 /* =========================================================================
  * main
  * ========================================================================= */
@@ -432,6 +479,7 @@ int main(int argc, char *argv[]) {
   RUN_TEST("usable size is fully writable", test_usable_size);
   RUN_TEST("large block returned to the OS", test_large_returned_to_os);
   RUN_TEST("realloc grow/shrink/mmap patterns", test_realloc_patterns);
+  RUN_TEST("mixed sizes 1B-300KB, heap verified", test_mixed_sizes);
 
   printf("\n-- Phase 4: Edge Cases & Stress --\n");
   RUN_TEST("large alloc (1 MB) read/write", test_large_alloc);

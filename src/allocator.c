@@ -42,6 +42,8 @@
 #define FLAG_MASK 15u
 
 #define MIN_BLOCK 32u
+#define NSMALL 62u
+#define NBINS 192u
 #define CHUNK_BYTES ((size_t)1 << 20)
 #define MMAP_THRESHOLD ((size_t)128 << 10)
 
@@ -58,7 +60,8 @@ typedef struct chunk {
 } chunk_t;
 
 static chunk_t *g_chunks;
-static block_t *g_free_head;
+static block_t *g_bins[NBINS];
+static uint64_t g_bitmap[NBINS / 64];
 static size_t g_mapped, g_peak_mapped, g_large_blocks;
 
 /* ------------------------------------------------------------------ */
@@ -123,42 +126,75 @@ static void account(size_t add, size_t sub) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Free list (explicit, doubly linked)                                 */
+/* Segregated free lists                                               */
+/*                                                                     */
+/* Bins 0..61 hold exactly one size each (32, 48, ... 1008 bytes).     */
+/* Larger sizes use four bins per power of two.  A bitmap records      */
+/* which bins are non-empty so the next usable bin is found with a     */
+/* count-trailing-zeros instead of a scan.  Every list is doubly       */
+/* linked, so unlinking a coalesced neighbour is O(1).                 */
 /* ------------------------------------------------------------------ */
 
+static unsigned bin_index(size_t s) {
+  if (s < 1024)
+    return (unsigned)(s >> 4) - 2;
+  unsigned l = 63u - (unsigned)__builtin_clzl(s); /* floor(log2 s) >= 10 */
+  unsigned i = NSMALL + (l - 10) * 4 + (unsigned)((s >> (l - 2)) & 3);
+  return i < NBINS ? i : NBINS - 1;
+}
+
 static void list_insert(block_t *b) {
+  unsigned i = bin_index(bsize(b));
   b->prev = NULL;
-  b->next = g_free_head;
-  if (g_free_head)
-    g_free_head->prev = b;
-  g_free_head = b;
+  b->next = g_bins[i];
+  if (g_bins[i])
+    g_bins[i]->prev = b;
+  g_bins[i] = b;
+  g_bitmap[i / 64] |= (uint64_t)1 << (i % 64);
 }
 
 static void list_remove(block_t *b) {
-  if (b->prev)
+  if (b->prev) {
     b->prev->next = b->next;
-  else
-    g_free_head = b->next;
+  } else {
+    unsigned i = bin_index(bsize(b));
+    g_bins[i] = b->next;
+    if (!b->next)
+      g_bitmap[i / 64] &= ~((uint64_t)1 << (i % 64));
+  }
   if (b->next)
     b->next->prev = b->prev;
 }
 
-static block_t *find_fit(size_t bs) {
-  block_t *best = NULL;
-  for (block_t *b = g_free_head; b; b = b->next) {
-    if (bsize(b) < bs)
-      continue;
-#ifdef LM_BEST_FIT
-    if (!best || bsize(b) < bsize(best)) {
-      best = b;
-      if (bsize(b) == bs)
-        break;
-    }
-#else
-    return b;
-#endif
+/* Index of the first non-empty bin >= i, or NBINS if there is none. */
+static unsigned next_bin(unsigned i) {
+  unsigned w = i / 64;
+  uint64_t bits = i < NBINS ? g_bitmap[w] & (~(uint64_t)0 << (i % 64)) : 0;
+  for (;;) {
+    if (bits)
+      return w * 64 + (unsigned)__builtin_ctzll(bits);
+    if (++w >= NBINS / 64)
+      return NBINS;
+    bits = g_bitmap[w];
   }
-  return best;
+}
+
+static block_t *find_fit(size_t bs) {
+  unsigned i = bin_index(bs);
+  if (i >= NSMALL) {
+    /* A large bin spans sizes both below and above bs: best fit within it. */
+    block_t *best = NULL;
+    for (block_t *b = g_bins[i]; b; b = b->next)
+      if (bsize(b) >= bs && (!best || bsize(b) < bsize(best)))
+        best = b;
+    if (best)
+      return best;
+  } else if (g_bins[i]) {
+    return g_bins[i]; /* exact size class */
+  }
+  /* Every block in a higher bin is large enough. */
+  unsigned j = next_bin(i + 1);
+  return j < NBINS ? g_bins[j] : NULL;
 }
 
 /* ------------------------------------------------------------------ */
@@ -247,7 +283,9 @@ static void trim(block_t *b, size_t bs) {
 
 static void *alloc_large(size_t bs) {
   size_t ps = page_size();
-  size_t len = (bs + ps - 1) & ~(ps - 1);
+  /* A dedicated mapping has no successor block to lend its prev_size word,
+   * so the payload starts at +16 and ends at the mapping's end. */
+  size_t len = (bs + 16 + ps - 1) & ~(ps - 1);
   if (len < bs)
     return NULL;
   block_t *b = os_mmap(len);
@@ -320,7 +358,7 @@ static void *realloc_core(void *p, size_t n) {
       trim(b, bs);
       return p;
     }
-  } else if (bs <= bsize(b) && bs > bsize(b) / 2) {
+  } else if (n <= usable(b) && n > usable(b) / 2) {
     return p;
   }
 
@@ -511,10 +549,16 @@ int lm_check(void) {
     CHECK((b->size & PREV_USED) == prev_used, "epilogue PREV_USED mismatch");
   }
   size_t listed = 0;
-  for (block_t *b = g_free_head; b; b = b->next) {
-    CHECK(!(b->size & USED), "used block on free list");
-    CHECK(!b->next || b->next->prev == b, "free-list link broken");
-    listed++;
+  for (unsigned i = 0; i < NBINS; i++) {
+    int bit = (g_bitmap[i / 64] >> (i % 64)) & 1;
+    CHECK(bit == (g_bins[i] != NULL), "bin bitmap out of sync");
+    CHECK(!g_bins[i] || !g_bins[i]->prev, "bin head has a predecessor");
+    for (block_t *b = g_bins[i]; b; b = b->next) {
+      CHECK(!(b->size & USED), "used block on free list");
+      CHECK(bin_index(bsize(b)) == i, "block in the wrong size bin");
+      CHECK(!b->next || b->next->prev == b, "free-list link broken");
+      listed++;
+    }
   }
   CHECK(listed == free_seen, "free-list count differs from heap walk");
   return 0;
