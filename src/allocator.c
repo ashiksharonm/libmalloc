@@ -68,7 +68,12 @@ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 #define LOCK() pthread_mutex_lock(&g_lock)
 #define UNLOCK() pthread_mutex_unlock(&g_lock)
 
+typedef struct large {
+  struct large *next, *prev;
+} large_t;
+
 static chunk_t *g_chunks;
+static large_t *g_large;
 static block_t *g_bins[NBINS];
 static uint64_t g_bitmap[NBINS / 64];
 static size_t g_mapped, g_peak_mapped, g_large_blocks;
@@ -290,27 +295,42 @@ static void trim(block_t *b, size_t bs) {
   release(r);
 }
 
+/* A dedicated mapping is [large_t links: 16B][block header+payload]; the
+ * block's size field is len - 16 and its payload runs to the end of the
+ * mapping. */
 static void *alloc_large(size_t bs) {
   size_t ps = page_size();
-  /* A dedicated mapping has no successor block to lend its prev_size word,
-   * so the payload starts at +16 and ends at the mapping's end. */
-  size_t len = (bs + 16 + ps - 1) & ~(ps - 1);
+  size_t len = (bs + 32 + ps - 1) & ~(ps - 1);
   if (len < bs)
     return NULL;
-  block_t *b = os_mmap(len);
-  if (!b)
+  char *mem = os_mmap(len);
+  if (!mem)
     return NULL;
-  b->size = len | USED | PREV_USED | MMAPPED;
+  large_t *l = (large_t *)mem;
+  l->prev = NULL;
+  l->next = g_large;
+  if (g_large)
+    g_large->prev = l;
+  g_large = l;
+  block_t *b = (block_t *)(mem + 16);
+  b->size = (len - 16) | USED | PREV_USED | MMAPPED;
   account(len, 0);
   g_large_blocks++;
   return payload(b);
 }
 
 static void free_large(block_t *b) {
-  size_t len = bsize(b);
+  large_t *l = (large_t *)((char *)b - 16);
+  size_t len = bsize(b) + 16;
+  if (l->prev)
+    l->prev->next = l->next;
+  else
+    g_large = l->next;
+  if (l->next)
+    l->next->prev = l->prev;
   g_large_blocks--;
   account(0, len);
-  munmap(b, len);
+  munmap(l, len);
 }
 
 /* allow_large == 0 forces the arena path (needed by aligned allocation,
@@ -496,6 +516,18 @@ size_t lm_usable_size(void *ptr) {
   return n;
 }
 
+int lm_owns(const void *ptr) {
+  const char *p = ptr;
+  int found = 0;
+  LOCK();
+  for (chunk_t *c = g_chunks; c && !found; c = c->next)
+    found = p >= (const char *)c + 32 && p < (const char *)c + c->len - 16;
+  for (large_t *l = g_large; l && !found; l = l->next)
+    found = p == (const char *)l + 32;
+  UNLOCK();
+  return found;
+}
+
 size_t lm_heap_bytes(void) {
   LOCK();
   size_t n = g_mapped;
@@ -624,6 +656,13 @@ static int check_locked(void) {
     }
   }
   CHECK(listed == free_seen, "free-list count differs from heap walk");
+  size_t larges = 0;
+  for (large_t *l = g_large; l; l = l->next) {
+    CHECK(!l->next || l->next->prev == l, "large-list link broken");
+    CHECK(((block_t *)((char *)l + 16))->size & MMAPPED, "large block lost its flag");
+    larges++;
+  }
+  CHECK(larges == g_large_blocks, "large-block count mismatch");
   return 0;
 }
 

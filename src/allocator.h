@@ -24,6 +24,10 @@ void *lm_aligned_alloc(size_t alignment, size_t size);
 /* Number of bytes the caller may use at ptr (>= the size requested). */
 size_t lm_usable_size(void *ptr);
 
+/* Non-zero if ptr is a live payload pointer returned by this allocator
+ * (a lookup over the chunks and large mappings, not a fast path). */
+int lm_owns(const void *ptr);
+
 /* Bytes currently obtained from the OS, and the high-water mark. */
 size_t lm_heap_bytes(void);
 size_t lm_peak_heap_bytes(void);

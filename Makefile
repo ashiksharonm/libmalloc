@@ -5,6 +5,7 @@
 #   make ubsan      tests under UndefinedBehaviorSanitizer
 #   make tsan       multithreaded test under ThreadSanitizer
 #   make valgrind   tests under valgrind (Linux)
+#   make shim       build the malloc drop-in shim; `make shim-test` runs programs under it
 #   make bench      build -O2 benchmarks and write results/bench.json
 #   make clean
 
@@ -18,7 +19,16 @@ LIB_SRCS = src/allocator.c
 TEST_SRC = tests/test_allocator.c
 MT_SRC   = tests/test_threads.c
 
-.PHONY: all tests run asan ubsan tsan valgrind bench check clean
+UNAME := $(shell uname -s)
+ifeq ($(UNAME),Darwin)
+SHIM_LIB = $(BUILD)/libmalloc_shim.dylib
+SHIM_FLAGS = -dynamiclib
+else
+SHIM_LIB = $(BUILD)/libmalloc_shim.so
+SHIM_FLAGS = -shared -fPIC
+endif
+
+.PHONY: shim shim-test all tests run asan ubsan tsan valgrind bench check clean
 all: tests
 
 tests: $(BUILD)/test_allocator $(BUILD)/test_threads
@@ -59,6 +69,13 @@ valgrind: | $(BUILD)
 bench:
 	sh bench/build.sh
 	python3 bench/run.py
+
+shim: $(SHIM_LIB)
+$(SHIM_LIB): $(LIB_SRCS) src/shim.c src/allocator.h | $(BUILD)
+	$(CC) $(CFLAGS) $(SHIM_FLAGS) -fPIC -o $@ $(LIB_SRCS) src/shim.c
+
+shim-test: $(SHIM_LIB)
+	sh tests/shim_test.sh $(SHIM_LIB)
 
 $(BUILD):
 	mkdir -p $(BUILD)
