@@ -195,7 +195,9 @@ static void test_posix_memalign(void) {
   void *p;
   assert(lm_posix_memalign(&p, 3, 8) != 0);  /* not a power of two */
   assert(lm_posix_memalign(&p, 4, 8) != 0);  /* smaller than sizeof(void*) */
-  assert(lm_aligned_alloc(64, 0) != NULL);
+  void *z = lm_aligned_alloc(64, 0);
+  assert(z != NULL && ((uintptr_t)z % 64) == 0);
+  lm_free(z);
 }
 
 static void test_usable_size(void) {
