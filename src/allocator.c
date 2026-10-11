@@ -26,6 +26,8 @@
 #define _DEFAULT_SOURCE
 #include "allocator.h"
 #include <errno.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -44,7 +46,7 @@
 #define MIN_BLOCK 32u
 #define NSMALL 62u
 #define NBINS 192u
-#define CHUNK_BYTES ((size_t)1 << 20)
+#define CHUNK_BYTES ((size_t)256 << 10)
 #define MMAP_THRESHOLD ((size_t)128 << 10)
 
 typedef struct block {
@@ -58,6 +60,13 @@ typedef struct chunk {
   struct chunk *next;
   size_t len;
 } chunk_t;
+
+/* One global lock.  Simple and correct; it is the contention point under many
+ * threads (see README).  The lock is never held across a call that can
+ * allocate (printf etc.), so the allocator can sit behind a malloc shim. */
+static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+#define LOCK() pthread_mutex_lock(&g_lock)
+#define UNLOCK() pthread_mutex_unlock(&g_lock)
 
 static chunk_t *g_chunks;
 static block_t *g_bins[NBINS];
@@ -406,15 +415,20 @@ static void *memalign_core(size_t align, size_t n) {
 void *lm_malloc(size_t size) {
   if (size == 0)
     return NULL;
+  LOCK();
   void *p = alloc_core(size, 1);
+  UNLOCK();
   if (!p)
     errno = ENOMEM;
   return p;
 }
 
 void lm_free(void *ptr) {
-  if (ptr)
-    free_core(ptr);
+  if (!ptr)
+    return;
+  LOCK();
+  free_core(ptr);
+  UNLOCK();
 }
 
 void *lm_calloc(size_t nmemb, size_t size) {
@@ -437,16 +451,25 @@ void *lm_realloc(void *ptr, size_t new_size) {
     lm_free(ptr);
     return NULL;
   }
+  LOCK();
   void *q = realloc_core(ptr, new_size);
+  UNLOCK();
   if (!q)
     errno = ENOMEM;
   return q;
 }
 
+static void *memalign_locked(size_t alignment, size_t size) {
+  LOCK();
+  void *p = memalign_core(alignment, size ? size : 1);
+  UNLOCK();
+  return p;
+}
+
 int lm_posix_memalign(void **out, size_t alignment, size_t size) {
   if (alignment < sizeof(void *) || (alignment & (alignment - 1)))
     return EINVAL;
-  void *p = memalign_core(alignment, size ? size : 1);
+  void *p = memalign_locked(alignment, size);
   if (!p)
     return ENOMEM;
   *out = p;
@@ -458,21 +481,40 @@ void *lm_aligned_alloc(size_t alignment, size_t size) {
     errno = EINVAL;
     return NULL;
   }
-  void *p = memalign_core(alignment, size ? size : 1);
+  void *p = memalign_locked(alignment, size);
   if (!p)
     errno = ENOMEM;
   return p;
 }
 
-size_t lm_usable_size(void *ptr) { return ptr ? usable(hdr(ptr)) : 0; }
-size_t lm_heap_bytes(void) { return g_mapped; }
-size_t lm_peak_heap_bytes(void) { return g_peak_mapped; }
+size_t lm_usable_size(void *ptr) {
+  if (!ptr)
+    return 0;
+  LOCK();
+  size_t n = usable(hdr(ptr));
+  UNLOCK();
+  return n;
+}
+
+size_t lm_heap_bytes(void) {
+  LOCK();
+  size_t n = g_mapped;
+  UNLOCK();
+  return n;
+}
+
+size_t lm_peak_heap_bytes(void) {
+  LOCK();
+  size_t n = g_peak_mapped;
+  UNLOCK();
+  return n;
+}
 
 /* ------------------------------------------------------------------ */
 /* Introspection                                                       */
 /* ------------------------------------------------------------------ */
 
-void lm_get_stats(lm_stats_t *o) {
+static void get_stats(lm_stats_t *o) {
   memset(o, 0, sizeof *o);
   for (chunk_t *c = g_chunks; c; c = c->next) {
     o->chunks++;
@@ -490,28 +532,49 @@ void lm_get_stats(lm_stats_t *o) {
   o->mapped_bytes = g_mapped;
 }
 
+void lm_get_stats(lm_stats_t *o) {
+  LOCK();
+  get_stats(o);
+  UNLOCK();
+}
+
 void lm_stats(void) {
   lm_stats_t s;
   lm_get_stats(&s);
   printf("\n===== HEAP STATS =====\n");
   printf("  Chunks       : %zu (%zu bytes mapped, peak %zu)\n", s.chunks,
-         s.mapped_bytes, g_peak_mapped);
+         s.mapped_bytes, lm_peak_heap_bytes());
   printf("  Used blocks  : %zu (%zu bytes)\n", s.used_blocks, s.used_bytes);
   printf("  Free blocks  : %zu (%zu bytes)\n", s.free_blocks, s.free_bytes);
   printf("  Large maps   : %zu\n", s.large_blocks);
   printf("======================\n\n");
 }
 
+/* Formats into a stack buffer and write(2)s it, so nothing in here can
+ * re-enter the allocator while the lock is held. */
+static void emit(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void emit(const char *fmt, ...) {
+  char buf[160];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof buf, fmt, ap);
+  va_end(ap);
+  if (n > 0 && write(1, buf, (size_t)(n < (int)sizeof buf ? n : (int)sizeof buf - 1)) < 0)
+    return;
+}
+
 void lm_heap_dump(void) {
-  printf("\n===== HEAP DUMP =====\n");
+  LOCK();
+  emit("\n===== HEAP DUMP =====\n");
   int idx = 0;
   for (chunk_t *c = g_chunks; c; c = c->next) {
-    printf("chunk %p len=%zu\n", (void *)c, c->len);
+    emit("chunk %p len=%zu\n", (void *)c, c->len);
     for (block_t *b = (block_t *)((char *)c + 16); bsize(b); b = next_phys(b))
-      printf("  [%4d] %p size=%-8zu %s\n", idx++, (void *)b, bsize(b),
-             (b->size & USED) ? "USED" : "FREE");
+      emit("  [%4d] %p size=%-8zu %s\n", idx++, (void *)b, bsize(b),
+           (b->size & USED) ? "USED" : "FREE");
   }
-  printf("=====================\n\n");
+  emit("=====================\n\n");
+  UNLOCK();
 }
 
 #define CHECK(cond, msg)                                                      \
@@ -522,7 +585,7 @@ void lm_heap_dump(void) {
     }                                                                         \
   } while (0)
 
-int lm_check(void) {
+static int check_locked(void) {
   size_t free_seen = 0;
   for (chunk_t *c = g_chunks; c; c = c->next) {
     block_t *b = (block_t *)((char *)c + 16);
@@ -562,4 +625,11 @@ int lm_check(void) {
   }
   CHECK(listed == free_seen, "free-list count differs from heap walk");
   return 0;
+}
+
+int lm_check(void) {
+  LOCK();
+  int rc = check_locked();
+  UNLOCK();
+  return rc;
 }

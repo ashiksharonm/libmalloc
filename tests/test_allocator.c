@@ -496,6 +496,7 @@ int main(int argc, char *argv[]) {
   printf("  Run manually:  ./build/test_allocator double_free\n");
   printf("  Expected: error printed, process aborts.\n\n");
 
+  fflush(stdout); /* lm_heap_dump writes with write(2) */
   lm_heap_dump();
   lm_stats();
 
