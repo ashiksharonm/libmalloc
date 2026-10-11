@@ -74,6 +74,7 @@ INTERPOSE(calloc);
 
 void *SHIM(realloc)(void *p, size_t n) {
   COUNT(n_realloc);
+#ifdef __APPLE__
   if (p && foreign(p)) {
     if (n == 0) {
       free(p);
@@ -87,6 +88,7 @@ void *SHIM(realloc)(void *p, size_t n) {
     }
     return q;
   }
+#endif
   return lm_realloc(p, n);
 }
 INTERPOSE(realloc);
