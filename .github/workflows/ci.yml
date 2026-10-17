@@ -21,6 +21,8 @@ jobs:
         run: make asan
       - name: UndefinedBehaviorSanitizer
         run: make ubsan
+      - name: Heap snapshot test
+        run: make json-test
       - name: Real programs under the malloc shim
         run: make shim-test
 
@@ -43,3 +45,23 @@ jobs:
       - uses: actions/checkout@v4
       - name: Test with the sbrk-backed arena
         run: make run CFLAGS="-Wall -Wextra -Werror -g -O1 -std=gnu11 -pthread -DLM_USE_SBRK -I./src"
+
+  # Measures on the GitHub-hosted runner; numbers are in the job summary and the
+  # uploaded JSON. Runner hardware varies between runs, so the CPU is recorded.
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Benchmark at -O2 and -O0 vs the system allocator (glibc)
+        run: |
+          mkdir -p results
+          for opt in -O2 -O0; do
+            OPT=$opt sh bench/build.sh
+            OPT=$opt python3 bench/run.py --out results/bench-ci$opt.json --markdown | tee -a table.md
+            echo >> table.md
+          done
+          { echo "## Benchmark (GitHub runner, ubuntu-latest)"; cat table.md; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: results/bench-ci-*.json

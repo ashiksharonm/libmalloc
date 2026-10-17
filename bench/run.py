@@ -4,7 +4,7 @@
 Usage: python3 bench/run.py [--out results/bench.json]
 Requires bench/build.sh to have been run.
 """
-import argparse, json, platform, subprocess, sys, datetime
+import argparse, json, os, platform, subprocess, sys, datetime
 
 WORKLOADS = ["random", "realloc", "small", "bigrandom", "mt4"]
 # (label, binary, impl arg). The baseline is single-threaded and was built for
@@ -29,15 +29,31 @@ def hardware():
             "cores": int(sh("nproc"))}
 
 
+def markdown(out):
+    by = {(x["workload"], x["impl"]): x for x in out["results"]}
+    hw = out["hardware"]
+    lines = [f"Hardware: {hw['cpu']}, {hw['cores']} cores, {hw['mem_bytes'] >> 30} GiB; {out['os']}; "
+             f"{out['compiler']}; flags `{out['flags']}`", "",
+             "| workload | current ops/s | system ops/s | system / current |", "|---|---|---|---|"]
+    for wl in WORKLOADS:
+        c, s = by.get((wl, "current")), by.get((wl, "system"))
+        if not c or not s or "failed" in c or "failed" in s:
+            continue
+        a, b = c["ops_per_s_median"], s["ops_per_s_median"]
+        lines.append(f"| {wl} | {a:,} | {b:,} | {b / a:.2f}x |")
+    return "\n".join(lines)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="results/bench.json")
+    ap.add_argument("--markdown", action="store_true", help="also print a current-vs-system table")
     args = ap.parse_args()
     out = {"date": datetime.date.today().isoformat(),
            "hardware": hardware(),
            "os": platform.platform(),
            "compiler": sh("cc --version | head -1"),
-           "flags": "-O2 -std=gnu11 -pthread",
+           "flags": os.environ.get("OPT", "-O2") + " -std=gnu11 -pthread",
            "notes": "median of 5 runs per cell (after one discarded warm-up); fragmentation = peak heap bytes "
                     "/ peak requested bytes (not reported for the system allocator)",
            "results": []}
@@ -56,6 +72,8 @@ def main():
     with open(args.out, "w") as f:
         json.dump(out, f, indent=2)
         f.write("\n")
+    if args.markdown:
+        print(markdown(out))
 
 
 if __name__ == "__main__":
