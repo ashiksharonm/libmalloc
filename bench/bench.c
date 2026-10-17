@@ -1,241 +1,206 @@
 /*
- * bench.c — Benchmark: libmalloc vs glibc malloc
+ * bench.c - allocator benchmark.
  *
- * Measures wall-clock time for three workload sizes:
- *   1,000 / 10,000 / 100,000 mixed alloc+free operations
+ *   bench <impl> <workload>     impl: lm | sys     workload: random | bigrandom
+ *                                         | realloc | small | mt4
  *
- * Methodology
- * -----------
- *   For each N:
- *     - Allocate N blocks of pseudo-random sizes (8–4096 bytes)
- *     - Write one byte to each block (prevents the compiler from
- *       optimising the allocation away)
- *     - Free all N blocks in random order
- *     - Repeat RUNS times; report the MINIMUM time (reduces OS scheduler noise)
- *   Run the same workload with lm_malloc and then with glibc malloc.
- *   The SAME pseudo-random sequence is used for both (reproducibility).
+ * Prints one JSON object (throughput = median of REPS runs after one warm-up run, plus peak-heap /
+ * peak-requested fragmentation where the allocator can report its heap size).
  *
- * Build
- * -----
- *   Compiled by: make bench           (first-fit libmalloc vs glibc)
- *                make bench_best_fit  (best-fit  libmalloc vs glibc)
- *
- * Run
- * ---
- *   ./build/bench
- *
- * Important note on LD_PRELOAD
- * ----------------------------
- *   The LD_PRELOAD trick (swapping symbols at runtime) requires building a
- *   shared library — that is Phase 3b.  This binary instead calls lm_malloc
- *   and glibc malloc explicitly in the same process, which is cleaner to
- *   understand and just as honest for the benchmark.
+ * "lm" resolves to whichever allocator this binary was linked with: the
+ * current src/allocator.c, or the pre-rewrite baseline in bench/baseline/
+ * (built with -DBASELINE, which measures heap growth through sbrk).
+ * Bookkeeping lives in static arrays so it never touches the allocator
+ * under test.
  */
-
-#include "../src/allocator.h"
-#include <stdint.h> /* uint64_t                        */
+#include "allocator.h"
+#include <pthread.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h> /* malloc / free / rand            */
-#include <string.h> /* memset                          */
-#include <time.h>   /* clock_gettime, CLOCK_MONOTONIC  */
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
 
-/* -------------------------------------------------------------------------
- * Configuration
- * ------------------------------------------------------------------------- */
-#define RUNS 5        /* repeat each measurement; take minimum       */
-#define SEED 0xDEAD42 /* fixed RNG seed for reproducibility          */
-#define MIN_SIZE 8    /* smallest allocation (bytes)                 */
-#define MAX_SIZE 4096 /* largest  allocation (bytes)                 */
+#define REPS 5
+#define MAX_THREADS 4
+#define MAX_SLOTS 32768
 
-static const int WORKLOADS[] = {1000, 10000, 100000};
-#define NUM_WORKLOADS (int)(sizeof(WORKLOADS) / sizeof(WORKLOADS[0]))
+static int use_sys;
 
-/* -------------------------------------------------------------------------
- * Tiny LCG pseudo-random number generator
- *
- * We roll our own (not rand()) so we can reset the seed deterministically
- * before EACH allocator's run, guaranteeing identical size sequences.
- *
- * LCG parameters from Numerical Recipes:
- *   x_{n+1} = (1664525 * x_n + 1013904223) mod 2^32
- * ------------------------------------------------------------------------- */
-static uint32_t lcg_state;
-
-static void lcg_seed(uint32_t seed) { lcg_state = seed; }
-
-static uint32_t lcg_next(void) {
-  lcg_state = lcg_state * 1664525u + 1013904223u;
-  return lcg_state;
+static void *do_malloc(size_t n) { return use_sys ? malloc(n) : lm_malloc(n); }
+static void do_free(void *p) { use_sys ? free(p) : lm_free(p); }
+static void *do_realloc(void *p, size_t n) {
+  return use_sys ? realloc(p, n) : lm_realloc(p, n);
 }
 
-/* Random allocation size in [MIN_SIZE, MAX_SIZE] */
-static size_t rand_size(void) {
-  return MIN_SIZE + (lcg_next() % (MAX_SIZE - MIN_SIZE + 1));
+typedef struct {
+  uint64_t s;
+} rng_t;
+static inline uint32_t rnd(rng_t *r) { /* xorshift64* */
+  r->s ^= r->s >> 12;
+  r->s ^= r->s << 25;
+  r->s ^= r->s >> 27;
+  return (uint32_t)((r->s * 2685821657736338717ULL) >> 32);
 }
 
-/* -------------------------------------------------------------------------
- * Timing helpers — nanosecond resolution
- * ------------------------------------------------------------------------- */
 static uint64_t now_ns(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
-/* Convert nanoseconds to microseconds (float) */
-static double ns_to_us(uint64_t ns) { return (double)ns / 1000.0; }
+static void die(void) {
+  fprintf(stderr, "bench: allocation failed\n");
+  exit(1);
+}
 
-/* -------------------------------------------------------------------------
- * Workload functions
- *
- * Both return elapsed time in nanoseconds.
- *
- * Pattern: batch-allocate N random-sized blocks, write one byte to each
- *          (so the compiler cannot elide the call), then free all.
- *
- * We use a fixed-size pointer array on the heap (ptrs is malloc'd with
- * the SYSTEM malloc regardless of which allocator is under test — it is
- * just bookkeeping, not part of the timed region).
- * ------------------------------------------------------------------------- */
+typedef struct {
+  void *p;
+  size_t n;
+} slot_t;
 
-/* --- libmalloc --- */
-static uint64_t bench_lm(int n) {
-  void **ptrs = malloc((size_t)n * sizeof(void *)); /* bookkeeping only */
-  if (!ptrs) {
-    perror("malloc ptrs");
-    exit(1);
+static slot_t slots[MAX_THREADS][MAX_SLOTS];
+
+typedef struct {
+  int tid;
+  const char *workload;
+  long ops;
+  size_t peak_req;
+} job_t;
+
+/* Each worker keeps its own live set; peak_req tracks live requested bytes. */
+static void run_job(job_t *j) {
+  slot_t *sl = slots[j->tid];
+  rng_t r = {0x9E3779B97F4A7C15ULL + (uint64_t)j->tid * 7919};
+  size_t live = 0, peak = 0;
+  int nslots = MAX_SLOTS;
+  uint32_t lo = 8, hi = 4096;
+  int is_realloc = !strcmp(j->workload, "realloc");
+  int is_small = !strcmp(j->workload, "small");
+  if (is_realloc) {
+    nslots = 128;
+    hi = 4096;
   }
+  if (is_small) {
+    nslots = 20000;
+    hi = 128;
+  }
+  if (!is_small && !is_realloc)
+    nslots = !strcmp(j->workload, "bigrandom") ? 16384 : 1024;
 
-  lcg_seed(SEED); /* deterministic size sequence */
-
-  uint64_t start = now_ns();
-
-  for (int i = 0; i < n; i++) {
-    size_t sz = rand_size();
-    ptrs[i] = lm_malloc(sz);
-    if (ptrs[i]) {
-      ((volatile char *)ptrs[i])[0] = 0xAB; /* defeat dead-code elim */
+  memset(sl, 0, sizeof(slot_t) * MAX_SLOTS);
+  for (long i = 0; i < j->ops; i++) {
+    uint32_t k = rnd(&r) % (uint32_t)nslots;
+    size_t n = lo + rnd(&r) % (hi - lo + 1);
+    slot_t *s = &sl[k];
+    if (is_realloc) {
+      void *q = do_realloc(s->p, n);
+      if (!q)
+        die();
+      live = live - s->n + n;
+      s->p = q;
+      s->n = n;
+    } else if (s->p) {
+      do_free(s->p);
+      live -= s->n;
+      s->p = NULL;
+      s->n = 0;
+    } else {
+      s->p = do_malloc(n);
+      if (!s->p)
+        die();
+      s->n = n;
+      live += n;
     }
+    if (s->p)
+      *(volatile char *)s->p = 1; /* touch so the call cannot be elided */
+    if (live > peak)
+      peak = live;
   }
-  for (int i = 0; i < n; i++) {
-    lm_free(ptrs[i]);
-  }
-
-  uint64_t elapsed = now_ns() - start;
-  free(ptrs);
-  return elapsed;
+  j->peak_req = peak;
+  for (int k = 0; k < nslots; k++)
+    if (sl[k].p)
+      do_free(sl[k].p);
 }
 
-/* --- glibc malloc --- */
-static uint64_t bench_glibc(int n) {
-  void **ptrs = malloc((size_t)n * sizeof(void *));
-  if (!ptrs) {
-    perror("malloc ptrs");
-    exit(1);
+static void *thread_main(void *a) {
+  run_job((job_t *)a);
+  return NULL;
+}
+
+static size_t heap_now(void) {
+#ifdef BASELINE
+  return (size_t)(uintptr_t)sbrk(0);
+#else
+  return lm_peak_heap_bytes();
+#endif
+}
+
+static int cmp_d(const void *a, const void *b) {
+  double x = *(const double *)a, y = *(const double *)b;
+  return (x > y) - (x < y);
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3) {
+    fprintf(stderr, "usage: %s <lm|sys> <random|bigrandom|realloc|small|mt4>\n", argv[0]);
+    return 2;
   }
+  use_sys = !strcmp(argv[1], "sys");
+  const char *wl = argv[2];
+  int threads = !strcmp(wl, "mt4") ? 4 : 1;
+  const char *inner = threads > 1 ? "bigrandom" : wl;
+  long ops = 1000000;
+#ifdef BASELINE
+  if (!use_sys)
+    ops = 200000; /* O(n) list scans: keep the baseline run short */
+#endif
 
-  lcg_seed(SEED); /* same seed → same sizes as libmalloc */
-
-  uint64_t start = now_ns();
-
-  for (int i = 0; i < n; i++) {
-    size_t sz = rand_size();
-    ptrs[i] = malloc(sz);
-    if (ptrs[i]) {
-      ((volatile char *)ptrs[i])[0] = 0xAB;
+  double ops_per_s[REPS];
+  double frag = -1;
+  size_t peak_req_max = 0, heap_base = 0;
+#ifdef BASELINE
+  heap_base = heap_now();
+#endif
+  for (int rep = -1; rep < REPS; rep++) { /* rep -1 is a discarded warm-up */
+    job_t jobs[MAX_THREADS];
+    pthread_t th[MAX_THREADS];
+    uint64_t t0 = now_ns();
+    for (int t = 0; t < threads; t++) {
+      jobs[t] = (job_t){t, inner, ops / threads, 0};
+      if (threads > 1)
+        pthread_create(&th[t], NULL, thread_main, &jobs[t]);
     }
+    if (threads == 1)
+      run_job(&jobs[0]);
+    else
+      for (int t = 0; t < threads; t++)
+        pthread_join(th[t], NULL);
+    uint64_t t1 = now_ns();
+    if (rep >= 0)
+      ops_per_s[rep] = (double)ops / ((double)(t1 - t0) / 1e9);
+    size_t req = 0;
+    for (int t = 0; t < threads; t++)
+      req += jobs[t].peak_req;
+    if (req > peak_req_max)
+      peak_req_max = req;
   }
-  for (int i = 0; i < n; i++) {
-    free(ptrs[i]);
+  qsort(ops_per_s, REPS, sizeof(double), cmp_d);
+  if (!use_sys) {
+    size_t heap = heap_now() - heap_base;
+    frag = (double)heap / (double)peak_req_max;
+    printf("{\"impl\":\"%s\",\"workload\":\"%s\",\"ops\":%ld,\"threads\":%d,"
+           "\"ops_per_s_median\":%.0f,\"ops_per_s_min\":%.0f,\"ops_per_s_max\":%.0f,"
+           "\"peak_heap_bytes\":%zu,\"peak_requested_bytes\":%zu,\"fragmentation\":%.3f}\n",
+           argv[1], wl, ops, threads, ops_per_s[REPS / 2], ops_per_s[0],
+           ops_per_s[REPS - 1], heap, peak_req_max, frag);
+  } else {
+    printf("{\"impl\":\"sys\",\"workload\":\"%s\",\"ops\":%ld,\"threads\":%d,"
+           "\"ops_per_s_median\":%.0f,\"ops_per_s_min\":%.0f,\"ops_per_s_max\":%.0f,"
+           "\"peak_requested_bytes\":%zu}\n",
+           wl, ops, threads, ops_per_s[REPS / 2], ops_per_s[0], ops_per_s[REPS - 1],
+           peak_req_max);
   }
-
-  uint64_t elapsed = now_ns() - start;
-  free(ptrs);
-  return elapsed;
-}
-
-/* -------------------------------------------------------------------------
- * Run one workload N times, return the MINIMUM elapsed nanoseconds.
- * (Minimum, not average, because outliers are caused by scheduler preemption;
- *  the minimum reflects best-achievable hardware throughput.)
- * ------------------------------------------------------------------------- */
-static uint64_t run_min(uint64_t (*bench_fn)(int), int n) {
-  uint64_t best = UINT64_MAX;
-  for (int r = 0; r < RUNS; r++) {
-    uint64_t t = bench_fn(n);
-    if (t < best)
-      best = t;
-  }
-  return best;
-}
-
-/* -------------------------------------------------------------------------
- * Pretty-print helpers
- * ------------------------------------------------------------------------- */
-static void print_separator(void) {
-  printf("+%-10s+%-20s+%-20s+%-10s+\n", "----------", "--------------------",
-         "--------------------", "----------");
-}
-
-static void print_header(void) {
-  print_separator();
-  printf("| %-8s | %-18s | %-18s | %-8s |\n", "Ops",
-#ifdef BEST_FIT
-         "lm (best-fit) µs",
-#else
-         "lm (first-fit) µs",
-#endif
-         "glibc malloc µs", "Ratio");
-  print_separator();
-}
-
-/* =========================================================================
- * main
- * ========================================================================= */
-int main(void) {
-  printf("\n");
-  printf("=============================================================\n");
-  printf("  libmalloc Benchmark — lm_malloc vs glibc malloc\n");
-  printf("  Strategy : %s\n",
-#ifdef BEST_FIT
-         "BEST-FIT + BOUNDARY TAGS"
-#else
-         "FIRST-FIT + BOUNDARY TAGS"
-#endif
-  );
-  printf("  Timing   : clock_gettime(CLOCK_MONOTONIC), %d runs/min\n", RUNS);
-  printf("  Sizes    : %d–%d bytes, pseudo-random (LCG seed=0x%X)\n", MIN_SIZE,
-         MAX_SIZE, SEED);
-  printf("=============================================================\n");
-
-  printf("\n");
-  print_header();
-
-  for (int w = 0; w < NUM_WORKLOADS; w++) {
-    int n = WORKLOADS[w];
-
-    uint64_t lm_ns = run_min(bench_lm, n);
-    uint64_t glibc_ns = run_min(bench_glibc, n);
-
-    double lm_us = ns_to_us(lm_ns);
-    double glibc_us = ns_to_us(glibc_ns);
-    double ratio = lm_us / glibc_us; /* >1.0 means lm is slower */
-
-    printf("| %-8d | %-18.1f | %-18.1f | %-8.2fx|\n", n, lm_us, glibc_us,
-           ratio);
-  }
-
-  print_separator();
-
-  printf("\n");
-  printf("Ratio < 1.0  → libmalloc is faster than glibc for this workload\n");
-  printf("Ratio > 1.0  → glibc is faster (expected — glibc is highly "
-         "optimised)\n");
-  printf("\n");
-  printf(
-      "NOTE: Fill in your ACTUAL numbers above in README.md for the resume.\n");
-  printf("      Do NOT copy numbers from this source file.\n");
-  printf("\n");
-
   return 0;
 }

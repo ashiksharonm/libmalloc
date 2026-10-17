@@ -1,178 +1,74 @@
-# libmalloc — A Custom Memory Allocator in C
+# libmalloc
 
-A fully working `malloc` / `free` / `realloc` / `calloc` implementation from scratch, built for learning and systems engineering portfolio purposes.
+A from-scratch `malloc` / `free` / `realloc` / `calloc` in C (~600 lines): segregated size-class free lists, boundary-tag coalescing, an mmap-backed arena, a global mutex, and a drop-in shim that can replace the system allocator in real programs. Built to learn allocator design, not to replace glibc.
 
-Built to understand: free-list management, boundary tags, coalescing, block splitting, and the tradeoffs between search strategies.
+## Design
 
----
+- **Arena**: memory is obtained in 256 KiB chunks via `mmap` (macOS and Linux). On Linux, `-DLM_USE_SBRK` switches chunks to `sbrk`. Each chunk is fenced by a prologue flag and a zero-size epilogue block, so coalescing never leaves a chunk. Requests >= 128 KiB get a dedicated mapping that is `munmap`ed on free.
+- **Blocks**: dlmalloc-style 8-byte overhead. A size word carries `USED`/`PREV_USED`/`MMAPPED` flags; the previous block's footer is stored in the next header only while that block is free. Payloads are 16-byte aligned; minimum block is 32 bytes.
+- **Free lists**: explicit doubly-linked lists (O(1) unlink when coalescing), segregated into 62 exact bins (32..1008 bytes) plus four bins per power of two above that. A bitmap of non-empty bins finds the next fit with a count-trailing-zeros. Inside a large bin the smallest fitting block is chosen.
+- **Coalescing**: immediate, both directions, O(1) via the boundary tags.
+- **realloc**: shrinks in place (returning the tail), grows in place into a free right neighbour, otherwise allocate + copy + free.
+- **Alignment**: `posix_memalign` / `aligned_alloc` over-allocate and split off the front. Aligned blocks needing >= 128 KiB are carved from arena chunks and are not returned to the OS.
+- **Safety**: double-free and misaligned-free are detected and trap. `lm_check()` verifies every invariant (flags, footers, bin membership, bitmap, counts) and is used throughout the tests.
+- **Threads**: one global `pthread` mutex. Correct, but it is the bottleneck under contention (see numbers).
 
-## Block Layout
+Known limits: no `fork` handler (a fork while another thread holds the lock can deadlock the child), no per-thread caches, chunks are never returned to the OS (only large mappings are).
 
-Every allocation is preceded by a header and followed by a footer (boundary tag):
-
-```
-+------------------------------------------+  ← block_header_t (32 bytes on 64-bit)
-│  .size     usable bytes in this block    │
-│  .is_free  1=free / 0=used               │
-│  .magic    0xCAFEBABE (used)             │
-│            0xDEADBEEF (free)             │
-│  .next  →  next block in chain           │
-│  .prev  →  previous block in chain       │
-+------------------------------------------+
-│  user data  (size bytes)                 │  ← pointer returned to caller
-+------------------------------------------+  ← block_footer_t (12 bytes)
-│  .size     (mirrors header.size)         │
-│  .is_free  (mirrors header.is_free)      │
-+------------------------------------------+
-```
-
-Total heap consumption per allocation: `HEADER_SIZE + size + FOOTER_SIZE`
-
----
-
-## Architecture
-
-### Heap Growth
-Uses `sbrk()` to extend the process data segment on demand. Each new block is appended to a single implicit block list anchored at `heap_start` (blocks carry `next`/`prev` pointers in their headers, and free and used blocks share the same list; there is no separate free list).
-
-### Free-List Strategy
-Two strategies, switchable at compile time:
-
-| Strategy | Flag | Behaviour |
-|----------|------|-----------|
-| First-fit | *(default)* | Returns first block ≥ requested size. O(1) best case. |
-| Best-fit | `-DBEST_FIT` | Scans entire list; returns smallest block that fits. Reduces fragmentation. |
-
-### Block Splitting
-If a free block is significantly larger than requested, it is split into two blocks: one allocated, one free remainder. Guards against `size_t` underflow before any subtraction.
-
-### Coalescing (Boundary Tag Technique)
-On every `lm_free()`, adjacent free blocks are merged immediately:
-
-- **Forward merge**: use `block->next` (O(1) via linked list)
-- **Backward merge**: use the footer of the physically preceding block (O(1) via boundary tag)
-
-Physical adjacency is verified before trusting the boundary tag — prevents corruption when the allocator shares the heap with `glibc malloc` (e.g., in benchmarks).
-
-**Four coalescing cases** (Knuth 1973):
-```
-Case 1: [USED][THIS][USED]  → nothing
-Case 2: [USED][THIS][FREE]  → merge with next
-Case 3: [FREE][THIS][USED]  → merge with prev
-Case 4: [FREE][THIS][FREE]  → three-way merge
-```
-
-### Safety
-- **Double-free detection**: magic field flips between `0xCAFEBABE` (used) and `0xDEADBEEF` (free). Double-free prints an error and calls `__builtin_trap()`.
-- **Overflow guard in calloc**: checks `nmemb * size` before multiplying.
-- **Alignment**: all sizes rounded up to a multiple of 16 bytes; returned payloads are 16-byte aligned (covered by a test).
-
----
-
-## Project Structure
+## Build and test
 
 ```
-libmalloc/
-├── src/
-│   ├── allocator.h       # block_header_t, block_footer_t, API
-│   ├── allocator.c       # malloc / free / realloc / calloc (fully commented)
-│   └── utils.c           # lm_heap_dump(), lm_stats()
-├── tests/
-│   └── test_allocator.c  # 15 tests + stress test + double-free detection
-├── bench/
-│   └── bench.c           # benchmark vs glibc malloc
-├── Makefile
-└── README.md
+make run        # tests + 8-thread test + double-free trap check
+make asan ubsan # sanitizers (tests and thread test)
+make tsan       # thread test under ThreadSanitizer
+make valgrind   # Linux
+make shim       # build/libmalloc_shim.{so,dylib}
+make shim-test  # run real programs under the shim
+make bench      # -O2 benchmark matrix -> results/bench.json
 ```
 
----
+CI (ubuntu + macOS): `-Wall -Wextra -Werror` at -O0 and -O2, ASAN, UBSAN, shim test; plus TSAN, valgrind and an sbrk-arena job on Linux.
 
-## Building and Running
+## Using it as a malloc replacement
 
-```bash
-# Build and run tests
-make run
-
-# Run with AddressSanitizer (macOS M2 / Linux)
-make asan
-
-# Run double-free detection test (crashes intentionally)
-./build/test_allocator double_free
-
-# Benchmark: first-fit vs system malloc (Apple libmalloc)
-make bench
-
-# Benchmark: best-fit vs system malloc (Apple libmalloc)
-make bench_best_fit
-
-# Valgrind (Linux only)
-make valgrind
-
-# Clean
-make clean
+```
+LD_PRELOAD=$PWD/build/libmalloc_shim.so ls -la                      # Linux
+DYLD_INSERT_LIBRARIES=$PWD/build/libmalloc_shim.dylib ./yourprog    # macOS
+LM_SHIM_REPORT=/tmp/report.txt ...   # append call counts at exit
 ```
 
----
+`tests/shim_test.sh` runs `ls -la`, `python3 -c "print(sum(range(10**6)))"` and a shell pipeline under the Linux shim in CI, and requires the report file to show allocator calls (so a silently unloaded shim fails). On macOS, SIP-protected system binaries ignore `DYLD_INSERT_LIBRARIES`; the test uses its own probe program and Homebrew python3. Verified locally on macOS (Apple M5) and in Linux CI / an Ubuntu 24.04 container.
 
-## Benchmark Results
+## Benchmarks
 
-> Measured on a MacBook with Apple M5 (16 GB), macOS, `clang` at `-O0` (the Makefile's default `CFLAGS`), via `make bench` / `make bench_best_fit`. The baseline "glibc" column is the **system allocator on macOS (Apple libmalloc)**, not glibc; `sbrk()` is deprecated on macOS, so treat the absolute numbers as indicative only. Re-run on Linux for glibc numbers.
+Apple M5, 10 cores, 16 GB, macOS, Apple clang 21, `-O2`, one run on 2026-10-11, median of 5 runs after a discarded warm-up (raw data and min/max in `results/bench.json`). "baseline" is the previous implementation (single implicit block list, first fit, sbrk), kept in `bench/baseline/`. "system" is Apple's allocator. Workloads are synthetic, fixed seed, one live-set of slots with random alloc/free (or realloc), sizes 8-4096 B (random), 8-4096 B (realloc, 128 slots), 8-128 B (small, 20k slots); bigrandom = random with 16k slots (~17 MB live); mt4 = bigrandom on 4 threads.
 
-**Methodology**: 5 runs per workload, minimum reported. Sizes: 8-4096 bytes (pseudo-random, fixed LCG seed). Timing: `clock_gettime(CLOCK_MONOTONIC)`. The ratio is large because every `lm_malloc` does a linear scan of one block list (O(n)) while the system allocator uses size-segregated bins.
+Throughput, ops/s (higher is better):
 
-### First-fit + Boundary Tags vs system malloc (Apple libmalloc)
+| Workload | baseline | current | system |
+|---|---|---|---|
+| random | 1.65 M | 12.8 M | 15.6 M |
+| realloc-heavy | failed* | 7.6 M | 6.1 M |
+| small-object | 66.5 k | 24.6 M | 16.4 M |
+| bigrandom | n/a | 8.0 M | 11.3 M |
+| mt4 (4 threads) | n/a | 1.15 M | 12.1 M |
 
-| Ops     | lm_malloc (µs) | System malloc (µs) | Ratio |
-|---------|---------------|-------------------|-------|
-| 1,000 | 1,736.0 | 79.0 | 22.0x |
-| 10,000 | 229,577.0 | 867.0 | 264.8x |
-| 100,000 | 3,426,577.0 | 12,448.0 | 275.3x |
+Fragmentation = peak heap bytes / peak requested bytes (system allocator does not report heap size here):
 
-### Best-fit + Boundary Tags vs system malloc (Apple libmalloc)
+| Workload | baseline | current |
+|---|---|---|
+| random | 1.12 | 1.26 |
+| small-object | 1.97 | 1.50 |
+| realloc-heavy | failed* | 1.63 |
+| bigrandom | n/a | 1.04 |
 
-| Ops     | lm_malloc (µs) | System malloc (µs) | Ratio |
-|---------|---------------|-------------------|-------|
-| 1,000 | 1,163.0 | 65.0 | 17.9x |
-| 10,000 | 219,002.0 | 905.0 | 242.0x |
-| 100,000 | 3,133,312.0 | 11,390.0 | 275.1x |
+Caveats: the baseline ran 200k ops per run (the others 1M) because its list scans are O(n); it is single-threaded and only run on the first three workloads. *The baseline aborted on the realloc workload with an allocation failure; its heap stopped growing near 4 MiB, which is consistent with macOS limiting `sbrk`, but I did not isolate the cause. Fragmentation at small live sizes is inflated by the 256 KiB chunk granularity. Run-to-run noise on this laptop is large (an earlier run of the same binaries gave different absolute numbers), so read the ratios loosely. With the single global lock, 4-thread throughput is about 10x below the system allocator.
 
----
+## Layout
 
-## Known Limitations vs system malloc (Apple libmalloc)
-
-| Feature | libmalloc | glibc (ptmalloc2) |
-|---------|-----------|-------------------|
-| Thread safety | ✗ No locks | ✓ Per-thread arenas |
-| Heap return to OS | ✗ Never (sbrk only grows) | ✓ `brk()` shrink + `mmap` return |
-| Size-class segregation | ✗ Single list | ✓ Bins for 8–512B ranges |
-| Mmap for large allocs | ✗ Always sbrk | ✓ `mmap` for allocs > 128KB |
-| Search strategy | First-fit / Best-fit | Bin-based O(1) lookup |
-| Decades of optimisation | ✗ ~400 lines | ✓ 40+ years |
-
-**Why is glibc faster?** glibc maintains separate *bins* (free lists segregated by size range), giving near-O(1) allocation for most sizes. It also uses `mmap` for large allocations so they can be returned to the OS immediately. libmalloc uses a single unsegregated list — honest, simple, and educational.
-
----
-
-## What I Learned
-
-- How `sbrk()` extends the process heap and why it can only grow (not shrink)
-- The Knuth boundary tag technique for O(1) bidirectional coalescing
-- Why `size_t` underflow is a real bug class and how to guard against it
-- Why first-fit and best-fit have different fragmentation characteristics
-- Why production allocators use size-segregated bins instead of a single list
-- How `LD_PRELOAD` can swap allocators at runtime for benchmarking
-
----
-
-## Valgrind (Linux)
-
-```bash
-valgrind --leak-check=full --error-exitcode=1 ./build/test_allocator
-# Expected: 0 errors, 0 leaks
 ```
-
-On macOS (M2), use AddressSanitizer instead:
-```bash
-make asan
-# Expected: no ASAN errors
+src/allocator.{h,c}  allocator          src/shim.c  malloc interposer
+tests/               unit, thread and shim tests
+bench/               harness, baseline/ (old implementation), run.py
+results/bench.json   measured data
 ```
