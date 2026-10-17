@@ -46,6 +46,13 @@ void lm_get_stats(lm_stats_t *out);
 void lm_stats(void);     /* print a summary to stdout */
 void lm_heap_dump(void); /* print every arena block to stdout */
 
+/* Write a JSON snapshot (bin occupancy, size histogram, per-chunk occupancy
+ * map, fragmentation figures) to fd / to a file.  Allocation-free, so it is
+ * safe behind the malloc shim.  "%p" in the path expands to the pid.
+ * The shim calls lm_dump_json() at exit when LM_HEAP_JSON=<path> is set. */
+int lm_dump_json_fd(int fd);
+int lm_dump_json(const char *path);
+
 /* Walk the whole heap and verify every invariant (boundary tags, flags,
  * free-list links, no adjacent free blocks).  Returns 0 if consistent;
  * otherwise prints the first violation to stderr and returns non-zero. */

@@ -137,6 +137,9 @@ size_t malloc_usable_size(void *p) { return lm_usable_size(p); }
 #endif
 
 __attribute__((destructor)) static void report(void) {
+  const char *json = getenv("LM_HEAP_JSON");
+  if (json && *json)
+    lm_dump_json(json);
   /* Appends to the file named by LM_SHIM_REPORT.  stderr is not used because
    * coreutils closes it in an atexit handler that runs before destructors. */
   const char *path = getenv("LM_SHIM_REPORT");

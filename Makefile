@@ -5,6 +5,7 @@
 #   make ubsan      tests under UndefinedBehaviorSanitizer
 #   make tsan       multithreaded test under ThreadSanitizer
 #   make valgrind   tests under valgrind (Linux)
+#   make json-test  heap-snapshot test (JSON vs lm_get_stats)
 #   make shim       build the malloc drop-in shim; `make shim-test` runs programs under it
 #   make bench      build -O2 benchmarks and write results/bench.json
 #   make clean
@@ -28,7 +29,7 @@ SHIM_LIB = $(BUILD)/libmalloc_shim.so
 SHIM_FLAGS = -shared -fPIC
 endif
 
-.PHONY: shim shim-test all tests run asan ubsan tsan valgrind bench check clean
+.PHONY: json-test shim shim-test all tests run asan ubsan tsan valgrind bench check clean
 all: tests
 
 tests: $(BUILD)/test_allocator $(BUILD)/test_threads
@@ -69,6 +70,11 @@ valgrind: | $(BUILD)
 bench:
 	sh bench/build.sh
 	python3 bench/run.py
+
+json-test: | $(BUILD)
+	$(CC) $(CFLAGS) -o $(BUILD)/test_json $(LIB_SRCS) tests/test_json.c
+	./$(BUILD)/test_json $(BUILD)/heap.json
+	python3 tools/render_heap.py $(BUILD)/heap.json --check $(BUILD)/heap.expect
 
 shim: $(SHIM_LIB)
 $(SHIM_LIB): $(LIB_SRCS) src/shim.c src/allocator.h | $(BUILD)

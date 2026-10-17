@@ -30,6 +30,16 @@ mkdir -p build
 cc -O1 -std=gnu11 -o build/shim_probe tests/shim_probe.c
 run_under 'probe ok' build/shim_probe
 
+# LM_HEAP_JSON: the shim writes a heap snapshot at exit; it must parse and show a live heap.
+rm -f build/shim_heap_*.json
+env "$PRELOAD=$SHIM" LM_HEAP_JSON=build/shim_heap_%p.json build/shim_probe >/dev/null
+python3 - build/shim_heap_*.json <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["mapped_bytes"] > 0 and d["used_blocks"] > 0 and d["chunks"], d
+print("ok: LM_HEAP_JSON snapshot parses (%d used blocks, %d chunks)" % (d["used_blocks"], len(d["chunks"])))
+PY
+
 if [ "$(uname -s)" = Linux ]; then
   run_under 'total' ls -la /usr
   run_under '^499999500000$' python3 -c "print(sum(range(10**6)))"

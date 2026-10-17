@@ -26,6 +26,7 @@
 #define _DEFAULT_SOURCE
 #include "allocator.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -607,6 +608,155 @@ void lm_heap_dump(void) {
   }
   emit("=====================\n\n");
   UNLOCK();
+}
+
+/* ---- JSON heap snapshot --------------------------------------------- */
+
+#define HEAP_CELLS 64 /* occupancy cells per chunk in the snapshot */
+
+typedef struct {
+  int fd;
+  size_t len;
+  char buf[4096];
+} jw_t;
+
+static void jw_flush(jw_t *w) {
+  size_t off = 0;
+  while (off < w->len) {
+    ssize_t n = write(w->fd, w->buf + off, w->len - off);
+    if (n <= 0)
+      break;
+    off += (size_t)n;
+  }
+  w->len = 0;
+}
+
+static void jw(jw_t *w, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void jw(jw_t *w, const char *fmt, ...) {
+  char tmp[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(tmp, sizeof tmp, fmt, ap);
+  va_end(ap);
+  if (n <= 0)
+    return;
+  if (n >= (int)sizeof tmp)
+    n = (int)sizeof tmp - 1;
+  if (w->len + (size_t)n > sizeof w->buf)
+    jw_flush(w);
+  memcpy(w->buf + w->len, tmp, (size_t)n);
+  w->len += (size_t)n;
+}
+
+/* Inclusive lower / exclusive upper block size covered by a bin. */
+static void bin_range(unsigned i, size_t *lo, size_t *hi) {
+  if (i < NSMALL) {
+    *lo = ((size_t)i + 2) * 16;
+    *hi = *lo + 16;
+    return;
+  }
+  unsigned l = (i - NSMALL) / 4 + 10, q = (i - NSMALL) % 4;
+  *lo = ((size_t)1 << l) + q * ((size_t)1 << (l - 2));
+  *hi = (i == NBINS - 1) ? 0 : *lo + ((size_t)1 << (l - 2)); /* 0 = unbounded */
+}
+
+int lm_dump_json_fd(int fd) {
+  jw_t *w = &(jw_t){.fd = fd};
+  size_t used_hist[48] = {0};
+  size_t free_total = 0, free_largest = 0, used_total = 0, nused = 0, nfree = 0;
+  LOCK();
+  for (chunk_t *c = g_chunks; c; c = c->next)
+    for (block_t *b = (block_t *)((char *)c + 16); bsize(b); b = next_phys(b)) {
+      size_t s = bsize(b);
+      if (b->size & USED) {
+        used_total += s;
+        nused++;
+        used_hist[63u - (unsigned)__builtin_clzl(s)]++;
+      } else {
+        free_total += s;
+        nfree++;
+        if (s > free_largest)
+          free_largest = s;
+      }
+    }
+  jw(w, "{\n  \"version\": 1,\n  \"mapped_bytes\": %zu,\n  \"peak_mapped_bytes\": %zu,\n",
+     g_mapped, g_peak_mapped);
+  jw(w, "  \"large_mappings\": %zu,\n  \"used_blocks\": %zu,\n  \"used_bytes\": %zu,\n",
+     g_large_blocks, nused, used_total);
+  jw(w, "  \"free_blocks\": %zu,\n  \"free_bytes\": %zu,\n  \"largest_free_block\": %zu,\n",
+     nfree, free_total, free_largest);
+  /* External fragmentation: share of free bytes not in the largest free block.
+   * Integer formatting only: libc's floating-point printf may call malloc,
+   * which would deadlock on the lock held here when behind the shim. */
+  size_t ef = free_total ? (size_t)((free_total - free_largest) * 10000 / free_total) : 0;
+  jw(w, "  \"external_fragmentation\": %zu.%04zu,\n", ef / 10000, ef % 10000);
+  jw(w, "  \"bins\": [");
+  int first = 1;
+  for (unsigned i = 0; i < NBINS; i++) {
+    size_t cnt = 0, bytes = 0;
+    for (block_t *b = g_bins[i]; b; b = b->next) {
+      cnt++;
+      bytes += bsize(b);
+    }
+    if (!cnt)
+      continue;
+    size_t lo, hi;
+    bin_range(i, &lo, &hi);
+    jw(w, "%s\n    {\"bin\": %u, \"min\": %zu, \"max\": %zu, \"blocks\": %zu, \"bytes\": %zu}",
+       first ? "" : ",", i, lo, hi, cnt, bytes);
+    first = 0;
+  }
+  jw(w, "\n  ],\n  \"used_size_log2\": [");
+  first = 1;
+  for (unsigned i = 0; i < 48; i++) {
+    if (!used_hist[i])
+      continue;
+    jw(w, "%s{\"log2\": %u, \"blocks\": %zu}", first ? "" : ", ", i, used_hist[i]);
+    first = 0;
+  }
+  jw(w, "],\n  \"chunks\": [");
+  first = 1;
+  for (chunk_t *c = g_chunks; c; c = c->next) {
+    /* Each cell holds the used bytes that fall in its slice of the chunk. */
+    size_t span = (c->len + HEAP_CELLS - 1) / HEAP_CELLS, cell[HEAP_CELLS] = {0};
+    char *base = (char *)c;
+    for (block_t *b = (block_t *)(base + 16); bsize(b); b = next_phys(b)) {
+      if (!(b->size & USED))
+        continue;
+      size_t from = (size_t)((char *)b - base), to = from + bsize(b);
+      for (size_t pos = from; pos < to;) {
+        size_t k = pos / span, end = (k + 1) * span < to ? (k + 1) * span : to;
+        if (k < HEAP_CELLS)
+          cell[k] += end - pos;
+        pos = end;
+      }
+    }
+    jw(w, "%s\n    {\"len\": %zu, \"occupancy\": [", first ? "" : ",", c->len);
+    for (unsigned k = 0; k < HEAP_CELLS; k++)
+      jw(w, "%s%zu.%02zu", k ? "," : "", cell[k] / span, cell[k] * 100 / span % 100);
+    jw(w, "]}");
+    first = 0;
+  }
+  jw(w, "\n  ]\n}\n");
+  UNLOCK();
+  jw_flush(w);
+  return 0;
+}
+
+/* "%p" in path is replaced by the pid so forked children do not collide. */
+int lm_dump_json(const char *path) {
+  char name[512];
+  const char *pp = strstr(path, "%p");
+  if (pp)
+    snprintf(name, sizeof name, "%.*s%ld%s", (int)(pp - path), path, (long)getpid(), pp + 2);
+  else
+    snprintf(name, sizeof name, "%s", path);
+  int fd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd < 0)
+    return -1;
+  int rc = lm_dump_json_fd(fd);
+  close(fd);
+  return rc;
 }
 
 #define CHECK(cond, msg)                                                      \
