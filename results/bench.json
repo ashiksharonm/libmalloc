@@ -1,0 +1,153 @@
+{
+  "date": "2026-10-11",
+  "hardware": {
+    "cpu": "Apple M5",
+    "mem_bytes": 17179869184,
+    "cores": 10
+  },
+  "os": "macOS-26.6.2-arm64-arm-64bit",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
+  "flags": "-O2 -std=gnu11 -pthread",
+  "notes": "median of 5 runs per cell (after one discarded warm-up); fragmentation = peak heap bytes / peak requested bytes (not reported for the system allocator)",
+  "results": [
+    {
+      "impl": "baseline",
+      "workload": "random",
+      "ops": 200000,
+      "threads": 1,
+      "ops_per_s_median": 1650805,
+      "ops_per_s_min": 1541984,
+      "ops_per_s_max": 1733974,
+      "peak_heap_bytes": 1404048,
+      "peak_requested_bytes": 1252314,
+      "fragmentation": 1.121
+    },
+    {
+      "impl": "current",
+      "workload": "random",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 12797707,
+      "ops_per_s_min": 12592080,
+      "ops_per_s_max": 13216499,
+      "peak_heap_bytes": 1572864,
+      "peak_requested_bytes": 1252314,
+      "fragmentation": 1.256
+    },
+    {
+      "impl": "system",
+      "workload": "random",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 15639907,
+      "ops_per_s_min": 12413108,
+      "ops_per_s_max": 17807536,
+      "peak_requested_bytes": 1252314
+    },
+    {
+      "impl": "baseline",
+      "workload": "realloc",
+      "failed": "bench: allocation failed"
+    },
+    {
+      "impl": "current",
+      "workload": "realloc",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 7626776,
+      "ops_per_s_min": 4582111,
+      "ops_per_s_max": 9097608,
+      "peak_heap_bytes": 524288,
+      "peak_requested_bytes": 322017,
+      "fragmentation": 1.628
+    },
+    {
+      "impl": "system",
+      "workload": "realloc",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 6149797,
+      "ops_per_s_min": 5640953,
+      "ops_per_s_max": 6304216,
+      "peak_requested_bytes": 322017
+    },
+    {
+      "impl": "baseline",
+      "workload": "small",
+      "ops": 200000,
+      "threads": 1,
+      "ops_per_s_median": 66548,
+      "ops_per_s_min": 64432,
+      "ops_per_s_max": 74838,
+      "peak_heap_bytes": 1381040,
+      "peak_requested_bytes": 701103,
+      "fragmentation": 1.97
+    },
+    {
+      "impl": "current",
+      "workload": "small",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 24579083,
+      "ops_per_s_min": 19065050,
+      "ops_per_s_max": 26072220,
+      "peak_heap_bytes": 1048576,
+      "peak_requested_bytes": 701103,
+      "fragmentation": 1.496
+    },
+    {
+      "impl": "system",
+      "workload": "small",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 16377066,
+      "ops_per_s_min": 15174507,
+      "ops_per_s_max": 16895317,
+      "peak_requested_bytes": 701103
+    },
+    {
+      "impl": "current",
+      "workload": "bigrandom",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 7976263,
+      "ops_per_s_min": 7868625,
+      "ops_per_s_max": 10462002,
+      "peak_heap_bytes": 18087936,
+      "peak_requested_bytes": 17357196,
+      "fragmentation": 1.042
+    },
+    {
+      "impl": "system",
+      "workload": "bigrandom",
+      "ops": 1000000,
+      "threads": 1,
+      "ops_per_s_median": 11253784,
+      "ops_per_s_min": 9926839,
+      "ops_per_s_max": 12389117,
+      "peak_requested_bytes": 17357196
+    },
+    {
+      "impl": "current",
+      "workload": "mt4",
+      "ops": 1000000,
+      "threads": 4,
+      "ops_per_s_median": 1146230,
+      "ops_per_s_min": 1081639,
+      "ops_per_s_max": 1308911,
+      "peak_heap_bytes": 69992448,
+      "peak_requested_bytes": 68985505,
+      "fragmentation": 1.015
+    },
+    {
+      "impl": "system",
+      "workload": "mt4",
+      "ops": 1000000,
+      "threads": 4,
+      "ops_per_s_median": 12143291,
+      "ops_per_s_min": 9554657,
+      "ops_per_s_max": 13481813,
+      "peak_requested_bytes": 68985505
+    }
+  ]
+}
