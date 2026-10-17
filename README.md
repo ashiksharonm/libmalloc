@@ -1,6 +1,6 @@
 # libmalloc
 
-A from-scratch `malloc` / `free` / `realloc` / `calloc` in C (~600 lines): segregated size-class free lists, boundary-tag coalescing, an mmap-backed arena, a global mutex, and a drop-in shim that can replace the system allocator in real programs. Built to learn allocator design, not to replace glibc.
+A from-scratch `malloc` / `free` / `realloc` / `calloc` in C (~600 lines): segregated size-class free lists, boundary-tag coalescing, an mmap-backed arena, a global mutex, and a drop-in shim that can replace the system allocator in real programs. Built to learn allocator design, not to replace glibc. Design notes: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Design
 
@@ -24,10 +24,11 @@ make tsan       # thread test under ThreadSanitizer
 make valgrind   # Linux
 make shim       # build/libmalloc_shim.{so,dylib}
 make shim-test  # run real programs under the shim
-make bench      # -O2 benchmark matrix -> results/bench.json
+make bench      # -O2 benchmark matrix -> results/bench.json (OPT=-O0 for unoptimised)
+make json-test  # heap snapshot test (JSON totals vs lm_get_stats)
 ```
 
-CI (ubuntu + macOS): `-Wall -Wextra -Werror` at -O0 and -O2, ASAN, UBSAN, shim test; plus TSAN, valgrind and an sbrk-arena job on Linux.
+CI (ubuntu + macOS): `-Wall -Wextra -Werror` at -O0 and -O2, ASAN, UBSAN, heap-snapshot test, shim test; plus TSAN, valgrind, an sbrk-arena job and a benchmark job on Linux.
 
 ## Using it as a malloc replacement
 
@@ -38,6 +39,15 @@ LM_SHIM_REPORT=/tmp/report.txt ...   # append call counts at exit
 ```
 
 `tests/shim_test.sh` runs `ls -la`, `python3 -c "print(sum(range(10**6)))"` and a shell pipeline under the Linux shim in CI, and requires the report file to show allocator calls (so a silently unloaded shim fails). On macOS, SIP-protected system binaries ignore `DYLD_INSERT_LIBRARIES`; the test uses its own probe program and Homebrew python3. Verified locally on macOS (Apple M5) and in Linux CI / an Ubuntu 24.04 container.
+
+## Heap visualizer
+
+Set `LM_HEAP_JSON=<path>` (a `%p` in the path becomes the pid) and the shim writes a heap snapshot when the process exits; `lm_dump_json(path)` does the same from code. The snapshot has free-list occupancy per bin, a histogram of live block sizes, a 64-cell occupancy strip per arena chunk, the largest free block and an external-fragmentation figure. `tools/render_heap.py` prints it as text and can write an SVG:
+
+```
+LM_HEAP_JSON=/tmp/heap_%p.json LD_PRELOAD=$PWD/build/libmalloc_shim.so python3 -c "print(sum(range(10**6)))"
+python3 tools/render_heap.py /tmp/heap_*.json --svg heap.svg
+```
 
 ## Benchmarks
 
@@ -64,11 +74,27 @@ Fragmentation = peak heap bytes / peak requested bytes (system allocator does no
 
 Caveats: the baseline ran 200k ops per run (the others 1M) because its list scans are O(n); it is single-threaded and only run on the first three workloads. *The baseline aborted on the realloc workload with an allocation failure; its heap stopped growing near 4 MiB, which is consistent with macOS limiting `sbrk`, but I did not isolate the cause. Fragmentation at small live sizes is inflated by the 256 KiB chunk granularity. Run-to-run noise on this laptop is large (an earlier run of the same binaries gave different absolute numbers), so read the ratios loosely. With the single global lock, 4-thread throughput is about 10x below the system allocator.
 
+### CI runner numbers (Linux)
+
+The `bench` CI job builds the same harness and runs it against glibc's allocator on a GitHub-hosted runner (`ubuntu-latest`): AMD EPYC 7763, 4 vCPU, 15 GiB, Linux 6.17, gcc 13.3, one run (CI run 39051454189, medians of 5). Ratio = system ops/s divided by current ops/s, so 1.80x means glibc is 1.80x faster. Runner hardware is shared and varies between runs; treat these as indicative.
+
+| Workload | -O2 current | -O2 system | -O2 ratio | -O0 current | -O0 system | -O0 ratio |
+|---|---|---|---|---|---|---|
+| random | 19.0 M | 20.5 M | 1.08x | 7.9 M | 14.2 M | 1.80x |
+| realloc-heavy | 13.3 M | 10.3 M | 0.78x | 5.5 M | 8.5 M | 1.54x |
+| small-object | 26.2 M | 32.3 M | 1.23x | 11.1 M | 19.9 M | 1.80x |
+| bigrandom | 11.9 M | 13.9 M | 1.17x | 5.9 M | 9.0 M | 1.52x |
+| mt4 (4 threads) | 2.1 M | 31.8 M | 15.1x | 1.4 M | 24.3 M | 16.9x |
+
+The earlier 265-275x gap at -O0 was the previous implementation (implicit list, first fit); the current allocator is within about 1.5-1.8x of glibc single-threaded at -O0 (the system allocator is always optimised; only this harness and the allocator are built at -O0) and about 15-17x behind with four threads, which is the cost of the single global lock. `-O2 realloc-heavy` is the one workload where the current allocator is ahead (0.78x). The job's step summary and `bench-results` artifact carry the raw JSON.
+
 ## Layout
 
 ```
 src/allocator.{h,c}  allocator          src/shim.c  malloc interposer
-tests/               unit, thread and shim tests
+tests/               unit, thread, snapshot and shim tests
+tools/render_heap.py heap snapshot renderer
+docs/DESIGN.md       allocator design notes
 bench/               harness, baseline/ (old implementation), run.py
 results/bench.json   measured data
 ```
